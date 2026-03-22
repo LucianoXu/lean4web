@@ -152,6 +152,52 @@ if (crtFile && keyFile) {
 
 const wss = new WebSocketServer({ server });
 
+// ── Warm-up Pool ──
+// Pre-spawn idle lake serve processes so the first user gets instant connection.
+// WARM_POOL_SIZE controls how many idle processes to keep per project.
+const WARM_POOL_SIZE = parseInt(process.env.WARM_POOL_SIZE ?? "1", 10);
+const WARM_PROJECT = process.env.WARM_PROJECT ?? null; // e.g. "Fanal"
+const warmPool = new Map(); // project -> [process, ...]
+
+function getOrSpawnProcess(project) {
+  const pool = warmPool.get(project);
+  if (pool && pool.length > 0) {
+    const ps = pool.shift();
+    console.log(`[warm-pool] Handing pre-warmed process to user for project: ${project} (${pool.length} remaining)`);
+    // Replenish the pool
+    replenishPool(project);
+    return ps;
+  }
+  // No warm process available — cold start
+  console.log(`[warm-pool] No warm process for ${project}, cold-starting...`);
+  return startServerProcess(project);
+}
+
+function replenishPool(project) {
+  const pool = warmPool.get(project) || [];
+  warmPool.set(project, pool);
+  while (pool.length < WARM_POOL_SIZE) {
+    console.log(`[warm-pool] Pre-spawning process for ${project} (pool: ${pool.length}/${WARM_POOL_SIZE})`);
+    const ps = startServerProcess(project);
+    if (ps && typeof ps !== "number") {
+      ps.on("close", () => {
+        // Remove dead process from pool
+        const idx = pool.indexOf(ps);
+        if (idx !== -1) pool.splice(idx, 1);
+      });
+      pool.push(ps);
+    }
+  }
+}
+
+// Pre-warm on startup after a short delay (let the server finish initializing)
+setTimeout(() => {
+  if (WARM_PROJECT) {
+    console.log(`[warm-pool] Pre-warming ${WARM_POOL_SIZE} process(es) for project: ${WARM_PROJECT}`);
+    replenishPool(WARM_PROJECT);
+  }
+}, 2000);
+
 function startServerProcess(project) {
   const PROJECT_PATH = path.join(PROJECTS_BASE_PATH, project);
   let serverProcess;
@@ -247,7 +293,7 @@ wss.addListener("connection", async function (ws, req) {
   const ip = anonymize(
     req.headers["x-forwarded-for"] || req.socket.remoteAddress,
   );
-  const ps = await startServerProcess(project);
+  const ps = await getOrSpawnProcess(project);
 
   if (ps === null) {
     console.error(
